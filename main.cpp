@@ -52,6 +52,8 @@ public:
     return {};
   }
 
+  auto &events() { return m_ptr->events; }
+
 private:
   T *m_ptr = nullptr;
 };
@@ -143,6 +145,39 @@ using destroy_fn = decltype([](wlr_xcursor_manager *ptr) {
 });
 W_CLASS_END
 
+namespace detail {
+template <typename Struct, typename Data = void> struct listener_base {
+public:
+  listener_base(const listener_base &) = delete;
+  listener_base(listener_base &&) = delete;
+  listener_base &operator=(const listener_base &) = delete;
+  listener_base &operator=(listener_base &&) = delete;
+
+  template <typename F>
+  listener_base(Struct *self, F)
+      : m_self_ptr(self),
+        m_listener{.notify = [](wl_listener *listener, void *data) -> void {
+          // NOLINTBEGIN
+          auto *pl = reinterpret_cast<listener_base *>(
+              reinterpret_cast<char *>(listener) -
+              offsetof(listener_base, m_listener));
+          // NOLINTEND
+          std::invoke(F{}, pl->m_self_ptr, static_cast<Data *>(data));
+        }} {}
+
+  ~listener_base() { wl_list_remove(&m_listener.link); }
+
+  constexpr wl_listener *get() { return std::addressof(m_listener); }
+
+  constexpr void add_to_signal(wl_signal &signal) {
+    wl_signal_add(&signal, get());
+  }
+
+private:
+  wl_listener m_listener; // mutable ?
+  Struct *m_self_ptr;
+};
+} // namespace detail
 class server {
 public:
   server() {
@@ -156,7 +191,7 @@ public:
     m_subcompositor = wlr_subcompositor_create(m_display.get());
     m_data_device_manager = wlr_data_device_manager_create(m_display.get());
 
-    wl_signal_add(&m_backend.get()->events.new_output, &m_listener_new_output);
+    wl_signal_add(&m_backend.events().new_output, m_listener_new_output.get());
 
     m_output_layout = output_layout::try_create().value();
     m_scene = scene::try_create().value();
@@ -167,21 +202,22 @@ public:
     m_cursor = cursor::try_create().value();
     m_cursor.attach_output_layout(m_output_layout);
 
-    wl_signal_add(&m_backend.get()->events.new_input, &m_listener_new_input);
+    wl_signal_add(&m_backend.events().new_input, m_listener_new_input.get());
 
-    wl_signal_add(&m_cursor.get()->events.motion, &m_listener_cursor_motion);
+    wl_signal_add(&m_cursor.events().motion, m_listener_cursor_motion.get());
 
-    wl_signal_add(&m_cursor.get()->events.frame, &m_listener_cursor_frame);
+    wl_signal_add(&m_cursor.events().frame, m_listener_cursor_frame.get());
 
     m_seat = seat::try_create(m_display, "seat0").value();
 
-    wl_signal_add(&m_seat.get()->events.request_set_cursor,
-                  &m_listener_request_cursor);
+    wl_signal_add(&m_seat.events().request_set_cursor,
+                  m_listener_request_cursor.get());
 
     m_xcursor_manager = xcursor_manager::try_create("default", 24).value();
 
     // ================
     const char *socket = wl_display_add_socket_auto(m_display.get());
+    wlr_log(WLR_INFO, "Running compositor on wayland display '%s'", socket);
     m_backend.start();
     m_display.run();
   }
@@ -208,89 +244,66 @@ private:
   xcursor_manager m_xcursor_manager;
 
 private:
-  template <std::size_t Offset, typename Data = void, typename F>
-  static constexpr auto get_listener_fn(F)
-      -> decltype(std::declval<wl_listener>().notify) {
-    return [](wl_listener *listener, void *data) -> void {
-      // NOLINTBEGIN
-      auto *self = reinterpret_cast<server *>(
-          reinterpret_cast<char *>(listener) - Offset);
-      // NOLINTEND
-      std::invoke(F{}, self, static_cast<Data *>(data));
-    };
-  }
+  template <typename Data> using listener = detail::listener_base<server, Data>;
 
-  template <std::size_t Offset, typename Data = void, typename F>
-  static constexpr wl_listener get_listener(F) {
-    return wl_listener{
-        .notify = get_listener_fn<Offset, Data>(F{}),
-    };
-  }
+  listener<wlr_output> m_listener_new_output{
+      this, [](server *self, wlr_output *output) {
+        wlr_output_init_render(output, self->m_allocator.get(),
+                               self->m_renderer.get());
+        {
+          wlr_output_state output_state{};
+          wlr_output_state_init(&output_state);
+          wlr_output_state_set_enabled(&output_state, true);
+          wlr_output_mode *mode = wlr_output_preferred_mode(output);
+          if (mode != nullptr)
+            wlr_output_state_set_mode(&output_state, mode);
+          wlr_output_commit_state(output, &output_state);
+          wlr_output_state_finish(&output_state);
+        }
 
-  // NOLINTBEGIN
-#define SERVER_LISTENER_MEMBER(Name, Type)                                     \
-  wl_listener m_listener_##Name =                                              \
-      get_listener<offsetof(server, m_listener_##Name), Type>
-  // NOLINTEND
+        auto *l_output =
+            wlr_output_layout_add_auto(self->m_output_layout.get(), output);
+        auto *scene_output =
+            wlr_scene_output_create(self->m_scene.get(), output);
+        wlr_scene_output_layout_add_output(self->m_scene_output_layout,
+                                           l_output, scene_output);
+      }};
 
-  SERVER_LISTENER_MEMBER(new_output, wlr_output)
-  ([](server *self, wlr_output *output) {
-    wlr_output_init_render(output, self->m_allocator.get(),
-                           self->m_renderer.get());
-    {
-      wlr_output_state output_state{};
-      wlr_output_state_init(&output_state);
-      wlr_output_state_set_enabled(&output_state, true);
-      wlr_output_mode *mode = wlr_output_preferred_mode(output);
-      if (mode != nullptr)
-        wlr_output_state_set_mode(&output_state, mode);
-      wlr_output_commit_state(output, &output_state);
-      wlr_output_state_finish(&output_state);
-    }
+  listener<wlr_input_device> m_listener_new_input{
+      this, [](server *self, wlr_input_device *device) {
+        switch (device->type) {
+        case WLR_INPUT_DEVICE_POINTER: {
+          wlr_log(WLR_DEBUG, "New pointer device: %s", device->name);
+          self->m_cursor.attach_input_device(device);
+          break;
+        }
+        case WLR_INPUT_DEVICE_KEYBOARD: {
+          break;
+        }
+        default:
+          break;
+        }
+      }};
 
-    auto *l_output =
-        wlr_output_layout_add_auto(self->m_output_layout.get(), output);
-    auto *scene_output = wlr_scene_output_create(self->m_scene.get(), output);
-    wlr_scene_output_layout_add_output(self->m_scene_output_layout, l_output,
-                                       scene_output);
-  });
+  listener<wlr_seat_pointer_request_set_cursor_event> m_listener_request_cursor{
+      this, [](server *self, wlr_seat_pointer_request_set_cursor_event *event) {
+        auto *client = self->m_seat.get()->pointer_state.focused_client;
+        wlr_log(WLR_DEBUG, "request cursor %p", client);
+        if (client == event->seat_client)
+          wlr_cursor_set_surface(self->m_cursor.get(), event->surface,
+                                 event->hotspot_x, event->hotspot_y);
+      }};
 
-  SERVER_LISTENER_MEMBER(new_input, wlr_input_device)
-  ([](server *self, wlr_input_device *device) {
-    switch (device->type) {
-    case WLR_INPUT_DEVICE_POINTER: {
-      wlr_log(WLR_DEBUG, "New pointer device: %s", device->name);
-      self->m_cursor.attach_input_device(device);
-      break;
-    }
-    case WLR_INPUT_DEVICE_KEYBOARD: {
-      break;
-    }
-    default:
-      break;
-    }
-  });
+  listener<void> m_listener_cursor_frame{
+      this, [](server *self, void *) { self->m_seat.pointer_notify_frame(); }};
 
-  SERVER_LISTENER_MEMBER(request_cursor,
-                         wlr_seat_pointer_request_set_cursor_event)
-  ([](server *self, wlr_seat_pointer_request_set_cursor_event *event) {
-    auto *client = self->m_seat.get()->pointer_state.focused_client;
-    wlr_log(WLR_DEBUG, "request cursor %p", client);
-    if (client == event->seat_client)
-      wlr_cursor_set_surface(self->m_cursor.get(), event->surface,
-                             event->hotspot_x, event->hotspot_y);
-  });
-
-  SERVER_LISTENER_MEMBER(cursor_frame, void)
-  ([](server *self, void *) { self->m_seat.pointer_notify_frame(); });
-
-  SERVER_LISTENER_MEMBER(cursor_motion, wlr_pointer_motion_event)
-  ([](server *self, wlr_pointer_motion_event *event) {
-    wlr_cursor_move(self->m_cursor.get(), &event->pointer->base, event->delta_x,
-                    event->delta_y);
-    wlr_cursor_set_xcursor(self->m_cursor.get(), self->m_xcursor_manager.get(),
-                           "default");
-  });
+  listener<wlr_pointer_motion_event> m_listener_cursor_motion{
+      this, [](server *self, wlr_pointer_motion_event *event) {
+        wlr_cursor_move(self->m_cursor.get(), &event->pointer->base,
+                        event->delta_x, event->delta_y);
+        wlr_cursor_set_xcursor(self->m_cursor.get(),
+                               self->m_xcursor_manager.get(), "default");
+      }};
 
 #undef SERVER_LISTENER_MEMBER
 };
