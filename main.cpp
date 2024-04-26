@@ -1,3 +1,4 @@
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <optional>
@@ -113,13 +114,27 @@ W_CLASS_END
 W_CLASS_BEGIN(cursor, wlr_cursor)
 using create_fn = decltype([]() { return wlr_cursor_create(); });
 using destroy_fn = decltype([](wlr_cursor *ptr) { wlr_cursor_destroy(ptr); });
-void attach_output_layout(output_layout &layout) {
+constexpr void attach_output_layout(output_layout &layout) {
   wlr_cursor_attach_output_layout(get(), layout.get());
 }
 
-void attach_input_device(wlr_input_device *device) {
+constexpr void move(double dx, double dy, wlr_input_device *device = nullptr) {
+  wlr_cursor_move(get(), device, dx, dy);
+}
+
+constexpr void attach_input_device(wlr_input_device *device) {
   wlr_cursor_attach_input_device(get(), device);
 }
+
+constexpr void set_xcursor(wlr_xcursor_manager *manager, const char *name) {
+  wlr_cursor_set_xcursor(get(), manager, name);
+}
+
+constexpr void set_surface(wlr_surface *surface = nullptr,
+                           int32_t hotspot_x = 0, int32_t hotspot_y = 0) {
+  wlr_cursor_set_surface(get(), surface, hotspot_x, hotspot_y);
+}
+
 W_CLASS_END
 
 W_CLASS_BEGIN(scene, wlr_scene)
@@ -191,7 +206,7 @@ public:
     m_subcompositor = wlr_subcompositor_create(m_display.get());
     m_data_device_manager = wlr_data_device_manager_create(m_display.get());
 
-    wl_signal_add(&m_backend.events().new_output, m_listener_new_output.get());
+    m_listener_new_output.add_to_signal(m_backend.events().new_output);
 
     m_output_layout = output_layout::try_create().value();
     m_scene = scene::try_create().value();
@@ -202,18 +217,17 @@ public:
     m_cursor = cursor::try_create().value();
     m_cursor.attach_output_layout(m_output_layout);
 
-    wl_signal_add(&m_backend.events().new_input, m_listener_new_input.get());
+    m_listener_new_input.add_to_signal(m_backend.events().new_input);
 
-    wl_signal_add(&m_cursor.events().motion, m_listener_cursor_motion.get());
+    m_listener_cursor_motion.add_to_signal(m_cursor.events().motion);
 
-    wl_signal_add(&m_cursor.events().frame, m_listener_cursor_frame.get());
+    m_listener_cursor_frame.add_to_signal(m_cursor.events().frame);
 
     m_seat = seat::try_create(m_display, "seat0").value();
 
-    wl_signal_add(&m_seat.events().request_set_cursor,
-                  m_listener_request_cursor.get());
+    m_listener_request_cursor.add_to_signal(m_seat.events().request_set_cursor);
 
-    m_xcursor_manager = xcursor_manager::try_create("default", 24).value();
+    m_xcursor_manager = xcursor_manager::try_create(nullptr, 32).value();
 
     // ================
     const char *socket = wl_display_add_socket_auto(m_display.get());
@@ -278,6 +292,7 @@ private:
           break;
         }
         case WLR_INPUT_DEVICE_KEYBOARD: {
+          wlr_keyboard *kbd = wlr_keyboard_from_input_device(device);
           break;
         }
         default:
@@ -290,8 +305,8 @@ private:
         auto *client = self->m_seat.get()->pointer_state.focused_client;
         wlr_log(WLR_DEBUG, "request cursor %p", client);
         if (client == event->seat_client)
-          wlr_cursor_set_surface(self->m_cursor.get(), event->surface,
-                                 event->hotspot_x, event->hotspot_y);
+          self->m_cursor.set_surface(event->surface, event->hotspot_x,
+                                     event->hotspot_y);
       }};
 
   listener<void> m_listener_cursor_frame{
@@ -299,10 +314,9 @@ private:
 
   listener<wlr_pointer_motion_event> m_listener_cursor_motion{
       this, [](server *self, wlr_pointer_motion_event *event) {
-        wlr_cursor_move(self->m_cursor.get(), &event->pointer->base,
-                        event->delta_x, event->delta_y);
-        wlr_cursor_set_xcursor(self->m_cursor.get(),
-                               self->m_xcursor_manager.get(), "default");
+        auto &c = self->m_cursor;
+        c.move(event->delta_x, event->delta_y, &event->pointer->base);
+        c.set_xcursor(self->m_xcursor_manager.get(), "default");
       }};
 
 #undef SERVER_LISTENER_MEMBER
