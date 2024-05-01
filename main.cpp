@@ -15,12 +15,19 @@ extern "C" {
 #include <wlr/types/wlr_scene.h>
 #include <wlr/types/wlr_subcompositor.h>
 #include <wlr/types/wlr_xcursor_manager.h>
+#include <wlr/types/wlr_xdg_shell.h>
 #include <wlr/util/log.h>
 }
 
 namespace mcage {
 using std::optional;
 using std::unique_ptr;
+
+template <typename T> struct default_free {
+  void operator()(T *ptr) const {
+    std::free(ptr); // NOLINT
+  }
+};
 
 // TODO: replace this with unique_ptr
 template <typename Derived, typename T> class w_ptr_wrapper_base {
@@ -114,24 +121,24 @@ W_CLASS_END
 W_CLASS_BEGIN(cursor, wlr_cursor)
 using create_fn = decltype([]() { return wlr_cursor_create(); });
 using destroy_fn = decltype([](wlr_cursor *ptr) { wlr_cursor_destroy(ptr); });
-constexpr void attach_output_layout(output_layout &layout) {
+void attach_output_layout(output_layout &layout) {
   wlr_cursor_attach_output_layout(get(), layout.get());
 }
 
-constexpr void move(double dx, double dy, wlr_input_device *device = nullptr) {
+void move(double dx, double dy, wlr_input_device *device = nullptr) {
   wlr_cursor_move(get(), device, dx, dy);
 }
 
-constexpr void attach_input_device(wlr_input_device *device) {
+void attach_input_device(wlr_input_device *device) {
   wlr_cursor_attach_input_device(get(), device);
 }
 
-constexpr void set_xcursor(wlr_xcursor_manager *manager, const char *name) {
+void set_xcursor(wlr_xcursor_manager *manager, const char *name) {
   wlr_cursor_set_xcursor(get(), manager, name);
 }
 
-constexpr void set_surface(wlr_surface *surface = nullptr,
-                           int32_t hotspot_x = 0, int32_t hotspot_y = 0) {
+void set_surface(wlr_surface *surface = nullptr, int32_t hotspot_x = 0,
+                 int32_t hotspot_y = 0) {
   wlr_cursor_set_surface(get(), surface, hotspot_x, hotspot_y);
 }
 
@@ -139,7 +146,7 @@ W_CLASS_END
 
 W_CLASS_BEGIN(scene, wlr_scene)
 using create_fn = decltype([]() { return wlr_scene_create(); });
-using destroy_fn = std::default_delete<wlr_scene>;
+using destroy_fn = default_free<wlr_scene>;
 W_CLASS_END
 
 W_CLASS_BEGIN(seat, wlr_seat)
@@ -149,6 +156,8 @@ using create_fn = decltype([](display &d, const char *name) {
 using destroy_fn = decltype([](wlr_seat *ptr) { wlr_seat_destroy(ptr); });
 
 void pointer_notify_frame() { wlr_seat_pointer_notify_frame(get()); }
+
+void set_keyboard(wlr_keyboard *kbd) { wlr_seat_set_keyboard(get(), kbd); }
 W_CLASS_END
 
 W_CLASS_BEGIN(xcursor_manager, wlr_xcursor_manager)
@@ -158,6 +167,15 @@ using create_fn = decltype([](const char *name, uint32_t size) {
 using destroy_fn = decltype([](wlr_xcursor_manager *ptr) {
   wlr_xcursor_manager_destroy(ptr);
 });
+W_CLASS_END
+
+W_CLASS_BEGIN(xdg_shell, wlr_xdg_shell)
+using create_fn = decltype([](display &d, uint32_t v = 3) {
+  return wlr_xdg_shell_create(d.get(), v);
+});
+
+using destroy_fn = decltype([](wlr_xdg_shell *ptr) {});
+
 W_CLASS_END
 
 namespace detail {
@@ -229,6 +247,9 @@ public:
 
     m_xcursor_manager = xcursor_manager::try_create(nullptr, 32).value();
 
+    m_xdg_shell = xdg_shell::try_create(m_display).value();
+    m_listener_new_xdg_toplevel.add_to_signal(m_xdg_shell.events().new_surface);
+
     // ================
     const char *socket = wl_display_add_socket_auto(m_display.get());
     wlr_log(WLR_INFO, "Running compositor on wayland display '%s'", socket);
@@ -242,6 +263,8 @@ private:
   renderer m_renderer;
   allocator m_allocator;
 
+  wlr_output *m_last_output;
+
   // will be destroyed by the display
   wlr_compositor *m_compositor;
   wlr_subcompositor *m_subcompositor;
@@ -251,6 +274,8 @@ private:
   output_layout m_output_layout;
 
   wlr_scene_output_layout *m_scene_output_layout;
+
+  xdg_shell m_xdg_shell;
 
   cursor m_cursor;
   seat m_seat;
@@ -275,6 +300,9 @@ private:
           wlr_output_state_finish(&output_state);
         }
 
+        self->m_last_output = output;
+        self->m_listener_output_frame.add_to_signal(output->events.frame);
+
         auto *l_output =
             wlr_output_layout_add_auto(self->m_output_layout.get(), output);
         auto *scene_output =
@@ -293,6 +321,8 @@ private:
         }
         case WLR_INPUT_DEVICE_KEYBOARD: {
           wlr_keyboard *kbd = wlr_keyboard_from_input_device(device);
+          self->m_seat.set_keyboard(kbd);
+          wlr_log(WLR_DEBUG, "New keyboard device: %s", device->name);
           break;
         }
         default:
@@ -319,7 +349,34 @@ private:
         c.set_xcursor(self->m_xcursor_manager.get(), "default");
       }};
 
-#undef SERVER_LISTENER_MEMBER
+  listener<wlr_xdg_surface> m_listener_new_xdg_toplevel{
+      this, [](server *self, wlr_xdg_surface *surface) {
+        if (surface->role != WLR_XDG_SURFACE_ROLE_TOPLEVEL)
+          return;
+        switch (surface->role) {
+        case WLR_XDG_SURFACE_ROLE_TOPLEVEL: {
+          auto *toplevel = surface->toplevel;
+          wlr_log(WLR_DEBUG, "New xdg toplevel: %s", toplevel->title);
+          auto *scene_tree = wlr_scene_xdg_surface_create(
+              &self->m_scene.get()->tree, toplevel->base);
+          wlr_scene_node_raise_to_top(&scene_tree->node);
+          break;
+        }
+        default:
+          break;
+        }
+      }};
+
+  listener<void> m_listener_output_frame{
+      this, [](server *self, void *) {
+        auto *scene = self->m_scene.get();
+        auto *scene_output =
+            wlr_scene_get_scene_output(scene, self->m_last_output);
+        wlr_scene_output_commit(scene_output, nullptr);
+        timespec now{};
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        wlr_scene_output_send_frame_done(scene_output, &now);
+      }};
 };
 } // namespace mcage
 
