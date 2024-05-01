@@ -1,3 +1,5 @@
+#include <cassert>
+#include <csignal>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -32,6 +34,8 @@ template <typename T> struct default_free {
 // TODO: replace this with unique_ptr
 template <typename Derived, typename T> class w_ptr_wrapper_base {
 public:
+  using base = w_ptr_wrapper_base<Derived, T>;
+
   w_ptr_wrapper_base() = default;
   w_ptr_wrapper_base(const w_ptr_wrapper_base &) = delete;
   w_ptr_wrapper_base &operator=(const w_ptr_wrapper_base &) = delete;
@@ -66,117 +70,135 @@ private:
   T *m_ptr = nullptr;
 };
 
-#define W_CLASS_BEGIN(Class, Type)                                             \
-  class Class : public w_ptr_wrapper_base<Class, Type> {                       \
-  public:                                                                      \
-    using Base = w_ptr_wrapper_base<Class, Type>;                              \
-    using Base::Base;
+class display : public w_ptr_wrapper_base<display, wl_display> {
+public:
+  using base::base;
+  using create_fn = decltype([]() { return wl_display_create(); });
+  using destroy_fn = decltype([](wl_display *ptr) { wl_display_destroy(ptr); });
 
-#define W_CLASS_END                                                            \
-  }                                                                            \
-  ;
+  void run() { wl_display_run(get()); }
 
-W_CLASS_BEGIN(display, wl_display)
-using create_fn = decltype([]() { return wl_display_create(); });
-using destroy_fn = decltype([](wl_display *ptr) { wl_display_destroy(ptr); });
+  void terminate() { wl_display_terminate(get()); }
 
-void run() { wl_display_run(get()); }
-W_CLASS_END
+  const char *add_socket_auto() { return wl_display_add_socket_auto(get()); }
 
-W_CLASS_BEGIN(backend, wlr_backend)
-using create_fn = decltype([](display &d) {
-  return wlr_backend_autocreate(d.get(), nullptr);
-});
-using destroy_fn = decltype([](wlr_backend *ptr) { wlr_backend_destroy(ptr); });
+  wlr_xdg_shell *init_xdg_shell(uint32_t version) {
+    if (m_xdg_shell == nullptr)
+      m_xdg_shell = wlr_xdg_shell_create(get(), version);
+    return m_xdg_shell;
+  }
 
-bool start() { return wlr_backend_start(get()); }
+  auto &xdg_shell_events() {
+    assert(m_xdg_shell != nullptr);
+    return m_xdg_shell->events;
+  }
 
-W_CLASS_END
+private:
+  wlr_xdg_shell *m_xdg_shell = nullptr;
+};
 
-W_CLASS_BEGIN(renderer, wlr_renderer)
-using create_fn =
-    decltype([](backend &b) { return wlr_renderer_autocreate(b.get()); });
-using destroy_fn =
-    decltype([](wlr_renderer *ptr) { wlr_renderer_destroy(ptr); });
+class backend : public w_ptr_wrapper_base<backend, wlr_backend> {
+public:
+  using base::base;
+  using create_fn = decltype([](display &d) {
+    return wlr_backend_autocreate(d.get(), nullptr);
+  });
+  using destroy_fn =
+      decltype([](wlr_backend *ptr) { wlr_backend_destroy(ptr); });
 
-void init_wl_display(display &d) {
-  wlr_renderer_init_wl_display(get(), d.get());
-}
-W_CLASS_END
+  bool start() { return wlr_backend_start(get()); }
+};
 
-W_CLASS_BEGIN(allocator, wlr_allocator)
-using create_fn = decltype([](backend &b, renderer &r) {
-  return wlr_allocator_autocreate(b.get(), r.get());
-});
-using destroy_fn =
-    decltype([](wlr_allocator *ptr) { wlr_allocator_destroy(ptr); });
-W_CLASS_END
+class renderer : public w_ptr_wrapper_base<renderer, wlr_renderer> {
+public:
+  using base::base;
+  using create_fn =
+      decltype([](backend &b) { return wlr_renderer_autocreate(b.get()); });
+  using destroy_fn =
+      decltype([](wlr_renderer *ptr) { wlr_renderer_destroy(ptr); });
 
-W_CLASS_BEGIN(output_layout, wlr_output_layout)
-using create_fn = decltype([]() { return wlr_output_layout_create(); });
-using destroy_fn =
-    decltype([](wlr_output_layout *ptr) { wlr_output_layout_destroy(ptr); });
-W_CLASS_END
+  void init_wl_display(display &d) {
+    wlr_renderer_init_wl_display(get(), d.get());
+  }
+};
 
-W_CLASS_BEGIN(cursor, wlr_cursor)
-using create_fn = decltype([]() { return wlr_cursor_create(); });
-using destroy_fn = decltype([](wlr_cursor *ptr) { wlr_cursor_destroy(ptr); });
-void attach_output_layout(output_layout &layout) {
-  wlr_cursor_attach_output_layout(get(), layout.get());
-}
+class allocator : public w_ptr_wrapper_base<allocator, wlr_allocator> {
+public:
+  using base::base;
+  using create_fn = decltype([](backend &b, renderer &r) {
+    return wlr_allocator_autocreate(b.get(), r.get());
+  });
+  using destroy_fn =
+      decltype([](wlr_allocator *ptr) { wlr_allocator_destroy(ptr); });
+};
 
-void move(double dx, double dy, wlr_input_device *device = nullptr) {
-  wlr_cursor_move(get(), device, dx, dy);
-}
+class output_layout
+    : public w_ptr_wrapper_base<output_layout, wlr_output_layout> {
+public:
+  using base::base;
+  using create_fn = decltype([]() { return wlr_output_layout_create(); });
+  using destroy_fn =
+      decltype([](wlr_output_layout *ptr) { wlr_output_layout_destroy(ptr); });
+};
 
-void attach_input_device(wlr_input_device *device) {
-  wlr_cursor_attach_input_device(get(), device);
-}
+class cursor : public w_ptr_wrapper_base<cursor, wlr_cursor> {
+public:
+  using base::base;
+  using create_fn = decltype([]() { return wlr_cursor_create(); });
+  using destroy_fn = decltype([](wlr_cursor *ptr) { wlr_cursor_destroy(ptr); });
+  void attach_output_layout(output_layout &layout) {
+    wlr_cursor_attach_output_layout(get(), layout.get());
+  }
 
-void set_xcursor(wlr_xcursor_manager *manager, const char *name) {
-  wlr_cursor_set_xcursor(get(), manager, name);
-}
+  void move(double dx, double dy, wlr_input_device *device = nullptr) {
+    wlr_cursor_move(get(), device, dx, dy);
+  }
 
-void set_surface(wlr_surface *surface = nullptr, int32_t hotspot_x = 0,
-                 int32_t hotspot_y = 0) {
-  wlr_cursor_set_surface(get(), surface, hotspot_x, hotspot_y);
-}
+  void attach_input_device(wlr_input_device *device) {
+    wlr_cursor_attach_input_device(get(), device);
+  }
 
-W_CLASS_END
+  void set_xcursor(wlr_xcursor_manager *manager, const char *name) {
+    wlr_cursor_set_xcursor(get(), manager, name);
+  }
 
-W_CLASS_BEGIN(scene, wlr_scene)
-using create_fn = decltype([]() { return wlr_scene_create(); });
-using destroy_fn = default_free<wlr_scene>;
-W_CLASS_END
+  void set_surface(wlr_surface *surface = nullptr, int32_t hotspot_x = 0,
+                   int32_t hotspot_y = 0) {
+    wlr_cursor_set_surface(get(), surface, hotspot_x, hotspot_y);
+  }
+};
 
-W_CLASS_BEGIN(seat, wlr_seat)
-using create_fn = decltype([](display &d, const char *name) {
-  return wlr_seat_create(d.get(), name);
-});
-using destroy_fn = decltype([](wlr_seat *ptr) { wlr_seat_destroy(ptr); });
+class scene : public w_ptr_wrapper_base<scene, wlr_scene> {
+public:
+  using base::base;
+  using create_fn = decltype([]() { return wlr_scene_create(); });
+  using destroy_fn = default_free<wlr_scene>;
+};
 
-void pointer_notify_frame() { wlr_seat_pointer_notify_frame(get()); }
+class seat : public w_ptr_wrapper_base<seat, wlr_seat> {
+public:
+  using base::base;
+  using create_fn = decltype([](display &d, const char *name) {
+    return wlr_seat_create(d.get(), name);
+  });
+  using destroy_fn = decltype([](wlr_seat *ptr) { wlr_seat_destroy(ptr); });
 
-void set_keyboard(wlr_keyboard *kbd) { wlr_seat_set_keyboard(get(), kbd); }
-W_CLASS_END
+  void pointer_notify_frame() { wlr_seat_pointer_notify_frame(get()); }
 
-W_CLASS_BEGIN(xcursor_manager, wlr_xcursor_manager)
-using create_fn = decltype([](const char *name, uint32_t size) {
-  return wlr_xcursor_manager_create(name, size);
-});
-using destroy_fn = decltype([](wlr_xcursor_manager *ptr) {
-  wlr_xcursor_manager_destroy(ptr);
-});
-W_CLASS_END
+  void set_keyboard(wlr_keyboard *kbd) { wlr_seat_set_keyboard(get(), kbd); }
+};
 
-W_CLASS_BEGIN(xdg_shell, wlr_xdg_shell)
-using create_fn = decltype([](display &d, uint32_t v = 3) {
-  return wlr_xdg_shell_create(d.get(), v);
-});
-
-using destroy_fn = decltype([](wlr_xdg_shell *ptr) {});
-
-W_CLASS_END
+class xcursor_manager
+    : public w_ptr_wrapper_base<xcursor_manager, wlr_xcursor_manager> {
+public:
+  using base::base;
+  using create_fn = decltype([](const char *name, uint32_t size) {
+    return wlr_xcursor_manager_create(name, size);
+  });
+  using destroy_fn = decltype([](wlr_xcursor_manager *ptr) {
+    wlr_xcursor_manager_destroy(ptr);
+  });
+};
 
 namespace detail {
 template <typename Struct, typename Data = void> struct listener_base {
@@ -247,15 +269,16 @@ public:
 
     m_xcursor_manager = xcursor_manager::try_create(nullptr, 32).value();
 
-    m_xdg_shell = xdg_shell::try_create(m_display).value();
-    m_listener_new_xdg_toplevel.add_to_signal(m_xdg_shell.events().new_surface);
+    m_display.init_xdg_shell(3);
+    m_listener_new_xdg_toplevel.add_to_signal(
+        m_display.xdg_shell_events().new_surface);
 
     // ================
-    const char *socket = wl_display_add_socket_auto(m_display.get());
-    wlr_log(WLR_INFO, "Running compositor on wayland display '%s'", socket);
-    m_backend.start();
-    m_display.run();
+    return;
   }
+
+  auto &get_display() { return m_display; }
+  auto &get_backend() { return m_backend; }
 
 private:
   display m_display;
@@ -274,8 +297,6 @@ private:
   output_layout m_output_layout;
 
   wlr_scene_output_layout *m_scene_output_layout;
-
-  xdg_shell m_xdg_shell;
 
   cursor m_cursor;
   seat m_seat;
@@ -380,7 +401,26 @@ private:
 };
 } // namespace mcage
 
+wl_display *g_display = nullptr;
+
 int main() {
   wlr_log_init(WLR_DEBUG, nullptr);
-  mcage::server g{};
+  mcage::server s{};
+  g_display = s.get_display().get();
+
+  const char *socket = s.get_display().add_socket_auto();
+  wlr_log(WLR_INFO, "Running compositor on wayland display '%s'", socket);
+  s.get_backend().start();
+
+  {
+    struct sigaction action {};
+    action.sa_handler = [](int) {
+      std::printf("Terminating display\n");
+      wl_display_terminate(g_display);
+    };
+    sigemptyset(&action.sa_mask);
+    sigaction(SIGINT, &action, nullptr);
+  }
+
+  s.get_display().run();
 }
