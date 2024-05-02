@@ -4,7 +4,14 @@
 #include <functional>
 #include <memory>
 #include <optional>
+#include <semaphore>
+#include <thread>
 #include <wayland-server-core.h>
+
+extern "C" {
+#include <spawn.h>
+#include <wait.h>
+}
 
 extern "C" {
 #include <wlr/backend.h>
@@ -70,6 +77,8 @@ private:
   T *m_ptr = nullptr;
 };
 
+class renderer;
+
 class display : public w_ptr_wrapper_base<display, wl_display> {
 public:
   using base::base;
@@ -82,7 +91,7 @@ public:
 
   const char *add_socket_auto() { return wl_display_add_socket_auto(get()); }
 
-  wlr_xdg_shell *init_xdg_shell(uint32_t version) {
+  auto *init_xdg_shell(uint32_t version) {
     if (m_xdg_shell == nullptr)
       m_xdg_shell = wlr_xdg_shell_create(get(), version);
     return m_xdg_shell;
@@ -93,8 +102,26 @@ public:
     return m_xdg_shell->events;
   }
 
+  auto *init_compositor(uint32_t version, renderer &renderer);
+
+  auto *init_subcompositor() {
+    if (m_subcompositor == nullptr)
+      m_subcompositor = wlr_subcompositor_create(get());
+    return m_subcompositor;
+  }
+
+  auto *init_data_device_manager() {
+    if (m_data_device_manager == nullptr)
+      m_data_device_manager = wlr_data_device_manager_create(get());
+    return m_data_device_manager;
+  }
+
 private:
+  // will be destroyed by the display
   wlr_xdg_shell *m_xdg_shell = nullptr;
+  wlr_compositor *m_compositor = nullptr;
+  wlr_subcompositor *m_subcompositor = nullptr;
+  wlr_data_device_manager *m_data_device_manager = nullptr;
 };
 
 class backend : public w_ptr_wrapper_base<backend, wlr_backend> {
@@ -121,6 +148,12 @@ public:
     wlr_renderer_init_wl_display(get(), d.get());
   }
 };
+
+auto *display::init_compositor(uint32_t version, renderer &renderer) {
+  if (m_compositor == nullptr)
+    m_compositor = wlr_compositor_create(get(), version, renderer.get());
+  return m_compositor;
+}
 
 class allocator : public w_ptr_wrapper_base<allocator, wlr_allocator> {
 public:
@@ -242,9 +275,9 @@ public:
     m_renderer.init_wl_display(m_display);
     m_allocator = allocator::try_create(m_backend, m_renderer).value();
 
-    m_compositor = wlr_compositor_create(m_display.get(), 5, m_renderer.get());
-    m_subcompositor = wlr_subcompositor_create(m_display.get());
-    m_data_device_manager = wlr_data_device_manager_create(m_display.get());
+    m_display.init_compositor(5, m_renderer);
+    m_display.init_subcompositor();
+    m_display.init_data_device_manager();
 
     m_listener_new_output.add_to_signal(m_backend.events().new_output);
 
@@ -272,9 +305,6 @@ public:
     m_display.init_xdg_shell(3);
     m_listener_new_xdg_toplevel.add_to_signal(
         m_display.xdg_shell_events().new_surface);
-
-    // ================
-    return;
   }
 
   auto &get_display() { return m_display; }
@@ -287,11 +317,6 @@ private:
   allocator m_allocator;
 
   wlr_output *m_last_output;
-
-  // will be destroyed by the display
-  wlr_compositor *m_compositor;
-  wlr_subcompositor *m_subcompositor;
-  wlr_data_device_manager *m_data_device_manager;
 
   scene m_scene;
   output_layout m_output_layout;
@@ -401,23 +426,41 @@ private:
 };
 } // namespace mcage
 
-wl_display *g_display = nullptr;
+std::counting_semaphore<1> sem{0};
 
 int main() {
   wlr_log_init(WLR_DEBUG, nullptr);
   mcage::server s{};
-  g_display = s.get_display().get();
-
   const char *socket = s.get_display().add_socket_auto();
   wlr_log(WLR_INFO, "Running compositor on wayland display '%s'", socket);
   s.get_backend().start();
 
+  setenv("WAYLAND_DISPLAY", socket, 1);
+
+  pid_t child_pid{};
+  {
+    ::posix_spawn_file_actions_t fa{};
+    ::posix_spawn_file_actions_init(&fa);
+    std::string file = "foot";
+    const std::array<char *, 2> argv = {file.data(), nullptr};
+    int res = ::posix_spawnp(&child_pid, file.c_str(), nullptr, nullptr,
+                             argv.data(), environ);
+    std::printf("Spawned %d\n", child_pid);
+  }
+
+  // run in another thread to prevent deadlock between client and compositor
+  std::jthread sig_thread([&, child_pid]() {
+    sem.acquire();
+    std::printf("Killing child %d\n", child_pid);
+    ::kill(child_pid, SIGTERM);
+    ::waitpid(child_pid, nullptr, 0);
+    std::printf("Terminating display\n");
+    s.get_display().terminate();
+  });
+
   {
     struct sigaction action {};
-    action.sa_handler = [](int) {
-      std::printf("Terminating display\n");
-      wl_display_terminate(g_display);
-    };
+    action.sa_handler = [](int) { sem.release(); };
     sigemptyset(&action.sa_mask);
     sigaction(SIGINT, &action, nullptr);
   }
