@@ -206,6 +206,10 @@ public:
   using base::base;
   using create_fn = decltype([]() { return wlr_scene_create(); });
   using destroy_fn = default_free<wlr_scene>;
+
+  decltype(auto) attach_output_layout(output_layout &layout) {
+    return wlr_scene_attach_output_layout(get(), layout.get());
+  }
 };
 
 class seat : public w_ptr_wrapper_base<seat, wlr_seat> {
@@ -243,15 +247,15 @@ public:
 
   template <typename F>
   listener_base(Struct *self, F)
-      : m_self_ptr(self),
-        m_listener{.notify = [](wl_listener *listener, void *data) -> void {
+      : m_listener{.notify = [](wl_listener *listener, void *data) -> void {
           // NOLINTBEGIN
           auto *pl = reinterpret_cast<listener_base *>(
               reinterpret_cast<char *>(listener) -
               offsetof(listener_base, m_listener));
           // NOLINTEND
           std::invoke(F{}, pl->m_self_ptr, static_cast<Data *>(data));
-        }} {}
+        }},
+        m_self_ptr(self) {}
 
   ~listener_base() { wl_list_remove(&m_listener.link); }
 
@@ -266,6 +270,34 @@ private:
   Struct *m_self_ptr;
 };
 } // namespace detail
+
+class keyboard {
+public:
+  explicit keyboard(wlr_keyboard *keyboard) : m_keyboard(keyboard) {
+    m_listener_key.add_to_signal(m_keyboard->events.key);
+  }
+
+  constexpr auto *get() { return m_keyboard; }
+
+  [[nodiscard]] bool set_keymap(xkb_keymap *keymap) {
+    return wlr_keyboard_set_keymap(m_keyboard, keymap);
+  }
+
+private:
+  wlr_keyboard *m_keyboard;
+
+  template <typename Data>
+  using listener = detail::listener_base<keyboard, Data>;
+
+  listener<wlr_keyboard_key_event> m_listener_key{
+      this, [](keyboard *self, wlr_keyboard_key_event *event) {
+        wlr_log(WLR_DEBUG, "Key event: %d state: %d", event->keycode,
+                event->state);
+      }};
+  listener<void> m_listener_destroy{
+      this, [](keyboard *self, void *) { delete self; }};
+};
+
 class server {
 public:
   server() {
@@ -284,8 +316,7 @@ public:
     m_output_layout = output_layout::try_create().value();
     m_scene = scene::try_create().value();
 
-    m_scene_output_layout =
-        wlr_scene_attach_output_layout(m_scene.get(), m_output_layout.get());
+    m_scene_output_layout = m_scene.attach_output_layout(m_output_layout);
 
     m_cursor = cursor::try_create().value();
     m_cursor.attach_output_layout(m_output_layout);
@@ -366,9 +397,19 @@ private:
           break;
         }
         case WLR_INPUT_DEVICE_KEYBOARD: {
-          wlr_keyboard *kbd = wlr_keyboard_from_input_device(device);
-          self->m_seat.set_keyboard(kbd);
           wlr_log(WLR_DEBUG, "New keyboard device: %s", device->name);
+          auto *kbd = new keyboard(
+              wlr_keyboard_from_input_device(device)); // FIXME: ownership
+          {
+            auto *context = xkb_context_new(XKB_CONTEXT_NO_FLAGS);
+            auto *keymap = xkb_keymap_new_from_names(
+                context, nullptr, XKB_KEYMAP_COMPILE_NO_FLAGS);
+            assert(kbd->set_keymap(keymap));
+            xkb_keymap_unref(keymap);
+            xkb_context_unref(context);
+          }
+          wlr_keyboard_set_repeat_info(kbd->get(), 25, 600);
+          self->m_seat.set_keyboard(kbd->get());
           break;
         }
         default:
@@ -397,8 +438,6 @@ private:
 
   listener<wlr_xdg_surface> m_listener_new_xdg_toplevel{
       this, [](server *self, wlr_xdg_surface *surface) {
-        if (surface->role != WLR_XDG_SURFACE_ROLE_TOPLEVEL)
-          return;
         switch (surface->role) {
         case WLR_XDG_SURFACE_ROLE_TOPLEVEL: {
           auto *toplevel = surface->toplevel;
@@ -406,6 +445,12 @@ private:
           auto *scene_tree = wlr_scene_xdg_surface_create(
               &self->m_scene.get()->tree, toplevel->base);
           wlr_scene_node_raise_to_top(&scene_tree->node);
+
+          auto *kbd = wlr_seat_get_keyboard(self->m_seat.get());
+          if (kbd != nullptr)
+            wlr_seat_keyboard_notify_enter(self->m_seat.get(), surface->surface,
+                                           kbd->keycodes, kbd->num_keycodes,
+                                           &kbd->modifiers);
           break;
         }
         default:
@@ -443,8 +488,8 @@ int main() {
     ::posix_spawn_file_actions_init(&fa);
     std::string file = "foot";
     const std::array<char *, 2> argv = {file.data(), nullptr};
-    int res = ::posix_spawnp(&child_pid, file.c_str(), nullptr, nullptr,
-                             argv.data(), environ);
+    ::posix_spawnp(&child_pid, file.c_str(), nullptr, nullptr, argv.data(),
+                   environ);
     std::printf("Spawned %d\n", child_pid);
   }
 
